@@ -1,4 +1,4 @@
-请按以下步骤检查并配置两台 NVIDIA DGX Spark 主机：
+## NVIDIA DGX Spark 双机环境检查与模型部署配置
 
 1. **主机信息**
    - spark-01：`xiaohessh@ip:port`
