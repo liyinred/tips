@@ -1,0 +1,131 @@
+# compose.yaml
+services:
+  vllm:
+    container_name: vllm-dsv4
+    image: docker.1ms.run/aidendle94/sparkrun-vllm-ds4-gb10:production-3.76.1
+    network_mode: host
+    ipc: host
+    shm_size: 32g
+    gpus: all
+    init: true
+    ulimits:
+      memlock: -1
+      nofile: 1048576
+      stack: 67108864
+    volumes:
+      - /data/models:/models
+      - ./path_aliases.py:/opt/api-extensions/path_aliases.py:ro
+    devices:
+      - /dev/infiniband:/dev/infiniband
+    environment:
+      PYTHONPATH: /opt/api-extensions
+      CUDA_VISIBLE_DEVICES: "0"
+      CUDA_DEVICE_ORDER: PCI_BUS_ID
+      CUTE_DSL_ARCH: sm_121a
+      NCCL_NET: IB
+      NCCL_IB_DISABLE: "0"    
+      NCCL_IB_HCA: "rocep1s0f1,roceP2p1s0f1"
+      NCCL_IB_GID_INDEX: "3"
+
+      NCCL_SOCKET_IFNAME: "enp1s0f1np1"
+      TP_SOCKET_IFNAME: "enp1s0f1np1"
+      MN_IF_NAME: "enp1s0f1np1"
+      GLOO_SOCKET_IFNAME: "enp1s0f1np1"
+      OMPI_MCA_btl_tcp_if_include: "enp1s0f1np1"
+      
+
+      NCCL_CROSS_NIC: "0"
+      NCCL_DEBUG: Info
+      NCCL_IB_TIMEOUT: "24"
+      NCCL_P2P_LEVEL: "2"
+      
+      NCCL_IB_QPS_PER_CONNECTION: "8"
+      NCCL_BUFFERSIZE: "16777216"
+      
+      NCCL_SOCKET_FAMILY: "inet"
+      NCCL_PROTO: LL,LL128,Simple
+      
+      NCCL_CUMEM_ENABLE: "0"
+      NCCL_IGNORE_CPU_AFFINITY: "1" 
+      
+      OMP_NUM_THREADS: "8"
+      HF_HUB_OFFLINE: "1"
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+      VLLM_PREFIX_CACHE_RETENTION_INTERVAL: "4096"
+      VLLM_USE_AOT_COMPILE: "1"
+      VLLM_USE_MEGA_AOT_ARTIFACT: "1"
+      VLLM_USE_BREAKABLE_CUDAGRAPH: "0"
+      VLLM_USE_V2_MODEL_RUNNER: "1"
+      VLLM_USE_FLASHINFER_SAMPLER: "1"
+      VLLM_MOE_SKIP_PADDING: "0"
+      VLLM_MEMORY_PROFILE_INCLUDE_ATTN: "1"
+      VLLM_USE_B12X_MOE: "1"
+      VLLM_DSPARK_REPLICATE_MARKOV_W1: "1"
+      VLLM_HOST_IP: "${HOST_IP}"
+      VLLM_SLEEP_WHEN_IDLE: "1"
+      ASYNC_SCHED: 1
+
+      NODE_RANK: "${NODE_RANK:?0 on head, 1 on worker}"
+      HEADLESS: "${HEADLESS:-}"
+    command:
+      - /bin/bash
+      - -lc
+      - |
+        set -euo pipefail
+        unset NCCL_GRAPH_FILE NCCL_GRAPH_DUMP_FILE VLLM_B12X_MLA_EXTEND_MAX_CHUNKS
+        export VLLM_ENABLE_PCIE_ALLREDUCE=0 VLLM_PCIE_ALLREDUCE_BACKEND=cpp
+        read -r -a HCAS <<< "$${NCCL_IB_HCA//,/ }"
+        if [ "$${#HCAS[@]}" -eq 0 ]; then
+          echo "[dspark] ERROR: NCCL_IB_HCA is empty" >&2
+          exit 1
+        fi
+        unset NCCL_IB_GID_INDEX
+        for gid_path in /sys/class/infiniband/"$${HCAS[0]}"/ports/1/gids/*; do
+          gid_index=$${gid_path##*/}
+          all_valid=1
+          for HCA in "$${HCAS[@]}"; do
+            gid_type=$(cat "/sys/class/infiniband/$$HCA/ports/1/gid_attrs/types/$$gid_index" 2>/dev/null || true)
+            gid_value=$(cat "/sys/class/infiniband/$$HCA/ports/1/gids/$$gid_index" 2>/dev/null || true)
+            if [[ "$$gid_type" != "RoCE v2" || "$$gid_value" != 0000:0000:0000:0000:0000:ffff:* ]]; then
+              all_valid=0
+              break
+            fi
+          done
+          if [ "$$all_valid" -eq 1 ]; then
+            export NCCL_IB_GID_INDEX=$$gid_index
+            break
+          fi
+        done
+        if [ -z "$${NCCL_IB_GID_INDEX:-}" ]; then
+          echo "[dspark] ERROR: no common RoCE-v2 IPv4 GID index for HCAS=$${NCCL_IB_HCA}" >&2
+          exit 1
+        fi
+        echo "[dspark] NODE_RANK=$${NODE_RANK} GID=$${NCCL_IB_GID_INDEX}"
+        if [ "$${ASYNC_SCHED:-1}" = "1" ]; then ASYNC_ARG="--async-scheduling"; else ASYNC_ARG=""; fi
+        exec vllm serve /models/DeepSeek-V4-Flash-0731 \
+          --served-model-name deepseek-v4-flash \
+          --host 0.0.0.0 --port 8000 --trust-remote-code \
+          --middleware path_aliases.PathAliasMiddleware \
+          --kv-cache-dtype fp8_ds_mla --block-size 256 --load-format auto \
+          --tensor-parallel-size 2 \
+          --gpu-memory-utilization 0.87 \
+          --max-num-seqs 16 \
+          --max-num-batched-tokens 8704 \
+          --max-cudagraph-capture-size 192 \
+          --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}' \
+          $${ASYNC_ARG} --no-scheduler-reserve-full-isl \
+          --enable-chunked-prefill --enable-prefix-caching --enable-prompt-tokens-details --enable-flashinfer-autotune \
+          --tokenizer-mode deepseek_v4 \
+          --tool-call-parser deepseek_v4 \
+          --reasoning-parser deepseek_v4 \
+          --enable-auto-tool-choice \
+          --default-chat-template-kwargs.temperature=1 \
+          --default-chat-template-kwargs.top_p=0.95 \
+          --default-chat-template-kwargs.thinking=true \
+          --default-chat-template-kwargs.reasoning_effort=low \
+          --attention-backend FLASHINFER_MLA_SPARSE_DSV4 \
+          --moe-backend b12x \
+          --nnodes 2 --node-rank "$${NODE_RANK}" \
+          --master-addr 192.168.100.10 --master-port 25000 \
+          $${HEADLESS:+--headless} \
+          --speculative-config "{\"method\":\"dspark\",\"num_speculative_tokens\":4,\"draft_sample_method\":\"greedy\"}"
