@@ -53,8 +53,7 @@ conda config --add channels http://mirrors.aliyun.com/anaconda/pkgs/r
 conda config --add channels http://mirrors.aliyun.com/anaconda/pkgs/msys2
 conda config --set show_channel_urls yes
 
-pip config set global.index-url https://mirrors.aliyun.com/pypi/simple
-pip config set install.trusted-host mirrors.aliyun.com
+pip config set global.index-url https://mirrors.cloud.tencent.com/pypi/simple
 ```
 
 ## 安装jupyterlab(base环境)
